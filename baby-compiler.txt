@@ -1,0 +1,1338 @@
+File: .gitignore
+/.lake
+---
+File: Main.lean
+-- Main.lean
+import Lean
+import Init.System.IO
+
+import Lang.Monad
+import Lang.Driver
+import Lang.Util
+
+open Lean
+open Lang.Monad
+
+/-- CLI entry point. -/
+unsafe def main (args : List String) : IO UInt32 := do
+  if args.length ≠ 2 then
+    IO.println "Usage: compiler <input-file> <output-file>"
+    return 1
+
+  let inputFile  := System.FilePath.mk args[0]!
+  let outputFile := System.FilePath.mk args[1]!
+
+  try
+    let input ← IO.FS.readFile inputFile
+    let env ← Lang.Util.createLangEnvironment
+    let llvmIr ← Lang.Monad.toIO (Lang.Driver.compile env input)
+    IO.FS.writeFile outputFile llvmIr
+    return 0
+  catch e =>
+    IO.eprintln (toString e)
+    return 1
+
+-- Lazy hack around lake... :/
+@[export lc_main]
+unsafe def lcMain (args: List String): IO UInt32 := main args
+
+---
+File: README.md
+# Baby Compiler
+
+It's a baby compiler.
+
+## Overview
+
+Source Code
+-> Parser (using Lean `declare_syntax_cat` and `Lean.Parser`)
+-> AST
+-> Type Checker
+-> Alpha Renamer (using Lean `FVarId`)
+-> LCNF Converter (AST to LCNF)
+-> Optimizer (Constant Folding, DCE)
+-> LLVM IR Generator
+-> LLVM IR
+
+## Syntax
+
+-   **Types:** `Int64`.
+-   **Expressions:**
+    -   Integer literals (e.g., `123`).
+    -   Variables (e.g., `x`).
+    -   Addition: `expr1 + expr2`.
+    -   Parenthesized expressions: `(expr)`.
+-   **Function Definitions:**
+    ```lean
+    def function_name (param1 : Int64) (param2 : Int64) : Int64 := body_expression
+    ```
+    -   Parameters and return type are `Int64`.
+    -   Body is a single expression.
+
+**Example Function:**
+```lean
+def my_add (a : Int64) (b : Int64) : Int64 := (a + b) + (a + 3)
+```
+
+If successful, this will compile to LLVM IR similar to:
+```llvm
+define i64 @my_add(i64 %param0, i64 %param1) {
+entry:
+  %temp0 = add i64 %param1, 5
+  %temp1 = add i64 %param0, %temp0
+  ret i64 %temp1
+}
+```
+(Note: The raw compiler output uses hash-based names for SSA variables, e.g., `%{12345}`. The example above shows the structurally equivalent form after normalization by the test suite, which ensures consistent comparisons.)
+A success message will be printed to the console:
+```
+Compiling file: my_func.lang...
+Successfully compiled my_func.lang and wrote LLVM IR to my_func.ll
+```
+
+## Building the Compiler
+
+To build the compiler, run:
+```bash
+lake build
+```
+This *should* create an executable compiler `./.lake/build/bin/compiler` (but it's Lake so... you never know.).
+
+To use it run:
+```bash
+./.lake/build/bin/compiler <input_file.lang> <output_file.ll>
+```
+
+*   `<input_file.lang>`: Path the source file.
+*   `<output_file.ll>`: Path where the generated LLVM IR will be saved.
+
+Note: The compiler executable might need to be run from the project root directory for it to correctly locate dynamically linked library components if not installed system-wide. (More broadly, if Lake is being mean to you, empty sympathy is the only thing I can offer.)
+
+## Project Structure
+
+*   `README.md`: <- You are here.
+*   `lakefile.lean`: Lake build system configuration.
+*   `lean-toolchain`: Lean version specification.
+*   `Main.lean`: Command-line entry point for the compiler.
+*   `Lang/`: Core compiler logic and utilities:
+    *   `AST.lean`: Abstract Syntax Tree definitions.
+    *   `Syntax.lean`: Text to `Lean.Syntax` conversion.
+    *   `Parser.lean`: `Lean.Syntax` to AST conversion.
+    *   `Checker.lean`: Type checking.
+    *   `AlphaRename.lean`: Variable name resolution.
+    *   `LCNF.lean`: Low-Level Compiler Normal Form (IR) definitions.
+    *   `Lower.lean`: AST to LCNF conversion.
+    *   `Monad.lean`: `LangM`, `LangState`, `LangError` definitions.
+    *   `Prim.lean`: Primitive operation definitions (`PrimInfo`).
+    *   `Optimize.lean`: Optimization passes
+    *   `Codegen.lean`: LCNF to LLVM IR generation.
+    *   `Driver.lean`: Core compilation pipeline logic.
+    *   `Util.lean`: Enviornment setup.
+    *   `Test.lean`: Tests on the sources in `examples`.
+    *   `Eval.lean`: A direct evaluator/interpreter for the AST (whose purpose shall remain mysterious for now.)
+*   `examples/`: Example programs and expected outputs:
+    *   `Sources/`: `.lang` source files.
+    *   `ExpectedLLVM/`: `.ll` files with expected LLVM IR.
+*   `.gitignore`: Git ignore file for Lean projects.
+*   `lake-manifest.json`: Dependency version tracking.
+
+## Examples
+
+
+1. **Basic Addition Function:**
+   ```bash
+   # Create a source file
+   echo "def add (x : Int64) (y : Int64) : Int64 := x + y" > add.lang
+   
+   # Compile
+   ./.lake/build/bin/compiler add.lang add.ll
+   
+   # View the generated LLVM IR
+   cat add.ll
+   ```
+
+   Expected output in `add.ll`:
+   ```llvm
+   define i64 @add(i64 %{hash0}, i64 %{hash1})
+   {
+     %{hash2} = add i64 %{hash0}, %{hash1}
+     ret i64 %{hash2}
+   }
+   ```
+   The placeholder hashes are the internal names for SSA variables generated by the compiler e.g. %{12345}.
+
+There are also error messages:
+
+```bash
+# Syntax error example (using = instead of :=)
+echo "def bad (x : Int64) : Int64 = x + 1" > bad.lang
+./.lake/build/bin/compiler bad.lang bad.ll
+# Output: Syntax Error: <input>:1:28: expected ':=' 
+
+# Undefined variable example (caught by checker)
+echo "def use_undef (p : Int64) : Int64 := p + zzz" > use_undef.lang
+./.lake/build/bin/compiler use_undef.lang use_undef.ll
+# Output: Name Error: Undefined variable 'zzz'
+
+# Duplicate parameter example
+echo "def sum (x : Int64) (x : Int64) : Int64 := x + 1" > sum.lang
+./.lake/build/bin/compiler sum.lang sum.ll
+# Output: Name Error: Duplicate parameter name 'x' in function 'sum'.
+```
+
+
+### Running Tests
+
+The test compiles `.lang` files from `examples/Sources` and compares (upto renaming) the generated LLVM IR against expected `.ll` files in `examples/ExpectedLLVM`.
+
+To run the test:
+```bash
+lake test
+```
+You should see output similar to:
+```
+Running test: test_dce_after_fold
+  PASS: test_dce_after_fold
+Running test: test_const_fold
+  PASS: test_const_fold
+Running test: ex_program_func_add
+  PASS: ex_program_func_add
+All 3 codegen tests passed!
+```
+---
+File: lakefile.lean
+import Lake
+open Lake DSL
+
+package compiler {
+
+}
+
+lean_lib Lang {
+  roots := #[`Lang.Syntax, `Lang.Parser, `Lang.AST, `Lang.Monad, `Lang.Checker, `Lang.AlphaRename, `Lang.Lower, `Lang.Optimize, `Lang.Codegen, `Lang.Eval, `Lang.Prim, `Lang.LCNF, `Lang.Test, `Lang.Driver, `Lang.Util]
+}
+
+@[default_target]
+lean_exe compiler {
+  root := `Main
+  supportInterpreter := true
+}
+
+@[test_driver]
+lean_exe test {
+  root := `Lang.Test
+  supportInterpreter := true
+}
+
+---
+File: lean-toolchain
+leanprover/lean4:v4.19.0-rc3
+
+---
+File: examples/ExpectedLLVM/ex_program_func_add.ll
+define i64 @f(i64 %0, i64 %1)
+{
+%addres.3 = add i64 %0, %1
+ret i64 %addres.3
+}
+---
+File: examples/ExpectedLLVM/test_const_fold.ll
+define i64 @const_fold_add()
+{
+ret i64 30
+} 
+---
+File: examples/ExpectedLLVM/test_dce_after_fold.ll
+define i64 @dce_after_fold(i64 %param0)
+{
+%temp0 = add i64 15, %param0
+ret i64 %temp0
+} 
+---
+File: examples/Sources/ex_program_func_add.lang
+def f (x : Int64) (y : Int64) : Int64 := x + y 
+---
+File: examples/Sources/test_const_fold.lang
+def const_fold_add : Int64 := 10 + 20 
+---
+File: examples/Sources/test_dce_after_fold.lang
+def dce_after_fold (p : Int64) : Int64 := (10 + 5) + p 
+---
+File: Lang/AST.lean
+import Lean
+
+namespace Lang.AST
+
+inductive LangTypeExpr where
+  | int64
+  deriving Repr, BEq, Inhabited, Nonempty
+
+instance : ToString LangTypeExpr where
+  toString typeExpr :=
+    match typeExpr with
+    | LangTypeExpr.int64 => "int64"
+
+inductive Expr where
+  | lit (n : Nat)
+  | var (name : String)
+  | add (lhs : Expr) (rhs : Expr)
+  deriving Repr, BEq, Inhabited, Nonempty
+
+structure FunDef where
+  name : String
+  params : List (String × LangTypeExpr)
+  returnType : LangTypeExpr
+  body : Expr
+  deriving Repr, BEq, Inhabited, Nonempty
+
+inductive Decl where
+  | funDef (def_ : FunDef)
+  deriving Repr, BEq, Inhabited, Nonempty
+
+end Lang.AST
+
+---
+File: Lang/AlphaRename.lean
+import Lean
+import Lang.AST
+import Lang.Monad
+import Lang.LCNF
+import Std.Data.HashMap
+
+namespace Lang.AlphaRename
+
+open Lean Lang.Monad Lang.LCNF
+
+/-- Alpha-renames `AST.Expr` using `origNameToUniqueNameStrMap`. -/
+partial def alphaRenameExpr (expr : Lang.AST.Expr) (origNameToUniqueNameStrMap : Std.HashMap String String) : Lang.Monad.LangM Lang.AST.Expr := do
+  match expr with
+  | Lang.AST.Expr.lit n => pure (Lang.AST.Expr.lit n)
+  | Lang.AST.Expr.var name => -- 'name' is the original string identifier here
+    match origNameToUniqueNameStrMap.get? name with
+    | some newUniqueAstName => pure (Lang.AST.Expr.var newUniqueAstName)
+    | none => Lang.Monad.throwNameError s!"Alpha rename: Undefined variable '{name}' or variable used out of scope."
+  | Lang.AST.Expr.add lhs rhs => do
+    let newLhs ← alphaRenameExpr lhs origNameToUniqueNameStrMap
+    let newRhs ← alphaRenameExpr rhs origNameToUniqueNameStrMap
+    -- The FVarId for the result of 'add' will be generated during Lowering.
+    pure (Lang.AST.Expr.add newLhs newRhs)
+
+/-- Alpha-renames `AST.FunDef`. Updates parameter names to unique `FVarId`-based strings and body variables. Populates `fvarDb`. -/
+def alphaRenameFunDef (funDef : Lang.AST.FunDef) : Lang.Monad.LangM Lang.AST.FunDef := do
+  let mut newAstParams : Array (String × Lang.AST.LangTypeExpr) := #[]
+  let mut origNameToUniqueNameStrMap : Std.HashMap String String := Std.HashMap.emptyWithCapacity funDef.params.length
+
+  for (pOrigName, pType) in funDef.params do
+    if origNameToUniqueNameStrMap.contains pOrigName then
+      Lang.Monad.throwNameError s!"Alpha rename: Duplicate parameter name '{pOrigName}' in function definition '{funDef.name}'."
+
+    let fvarId ← Lean.mkFreshFVarId
+    let newUniqueName := LCNF.llvmName fvarId
+
+    let fvarInfoEntry : FVarInfo := { uniqueName := newUniqueName }
+    modify fun s => { s with fvarDb :=
+      { infoById := s.fvarDb.infoById.insert fvarId fvarInfoEntry,
+        idByName := s.fvarDb.idByName.insert newUniqueName fvarId
+      }
+    }
+
+    newAstParams := newAstParams.push (newUniqueName, pType)
+    origNameToUniqueNameStrMap := origNameToUniqueNameStrMap.insert pOrigName newUniqueName
+
+  let newBody ← alphaRenameExpr funDef.body origNameToUniqueNameStrMap
+
+  let renamedFunDef : Lang.AST.FunDef := { funDef with
+    name   := funDef.name,
+    params := newAstParams.toList,
+    body   := newBody
+  }
+  pure renamedFunDef
+
+end Lang.AlphaRename
+
+---
+File: Lang/Checker.lean
+import Lean
+import Lang.AST
+import Lang.Monad
+import Std.Data.HashMap
+
+namespace Lang.Checker
+
+open Lang.AST Lang.Monad Std
+
+-- Type Environment: Maps variable name (String) to LangTypeExpr.
+abbrev TypeEnv := HashMap String LangTypeExpr
+
+/-- Infers type of an `AST.Expr` given `TypeEnv`. Returns `LangTypeExpr` or `LangError`. -/
+partial def infer (env : TypeEnv) (e : AST.Expr) : LangM LangTypeExpr := do
+  match e with
+  | AST.Expr.lit _ =>
+    -- All literals are currently int64
+    pure LangTypeExpr.int64
+
+  | AST.Expr.var name =>
+    match env.get? name with
+    | some typeExpr => pure typeExpr
+    | none => throwNameError s!"Undefined variable '{name}'"
+
+  | AST.Expr.add lhs rhs =>
+    let lhsType ← infer env lhs
+    let rhsType ← infer env rhs
+    if lhsType == LangTypeExpr.int64 && rhsType == LangTypeExpr.int64 then
+      pure LangTypeExpr.int64
+    else
+      throwTypeError s!"'+ ' operator expects two int64 operands, got '{lhsType}' and '{rhsType}'"
+
+/-- Type-checks `AST.FunDef`. Infers body type from parameter types. Returns `LangM Unit` or `LangError`. -/
+def checkFunDef (funDef : AST.FunDef) : LangM Unit := do
+  let mut initialEnv : TypeEnv := HashMap.emptyWithCapacity 0
+  for (paramName, paramType) in funDef.params do
+    if initialEnv.contains paramName then
+      throwNameError s!"Duplicate parameter name '{paramName}' in function '{funDef.name}'"
+    initialEnv := initialEnv.insert paramName paramType
+
+  let bodyType ← infer initialEnv funDef.body
+  if bodyType != funDef.returnType then
+    throwTypeError s!"Type mismatch in function '{funDef.name}'. Body has type '{bodyType}' but declared return type is '{funDef.returnType}'."
+  pure ()
+
+end Lang.Checker
+
+---
+File: Lang/Codegen.lean
+import Lean
+import Lang.LCNF
+import Lang.Monad
+import Lang.Prim
+import Std.Data.HashMap
+import Lang.AST
+
+namespace Lang.Codegen
+
+open Lang.LCNF Lang.Monad Lean Std Lang.Prim Lang.AST
+
+/-- Gets LLVM SSA value name for `FVarId` from `fvarDb.infoById[fvarId].uniqueName`. -/
+def getLLVMSsaValueForFVar (fvarId : FVarId) : LangM String := do
+  match (← get).fvarDb.infoById.get? fvarId with
+  | some info => pure info.uniqueName
+  | none => throwCodegenError s!"No FVarInfo found for FVarId '{fvarId.name}' in fvarDb.infoById."
+
+partial def codegenArg (arg : LCNF.Arg) (visited : Std.HashSet FVarId := Std.HashSet.emptyWithCapacity 0) : LangM String := do
+  match arg with
+  | LCNF.Arg.fvar fvarId =>
+    if visited.contains fvarId then
+      throwCodegenError s!"Circular alias detected for FVarId '{fvarId.name}' when resolving argument."
+    let s ← get
+    match s.fvarDb.infoById.get? fvarId with
+    | some info =>
+      match info.valueAlias with
+      | some aliasArg => codegenArg aliasArg (visited.insert fvarId) -- Recursively resolve alias
+      | none => pure info.uniqueName -- No alias, use its own unique SSA name
+    | none => throwCodegenError s!"No FVarInfo found for FVarId '{fvarId.name}' in fvarDb.infoById when resolving argument."
+  | LCNF.Arg.lit val => pure (toString val)
+
+def lcnfTypeToLLVMType (typeInstance : LangTypeExpr) : LangM String := do
+  match typeInstance with
+  | LangTypeExpr.int64 => pure "i64"
+
+
+partial def codegenCode (code : LCNF.Code) (currentSeenNames : Std.HashSet String) : LangM (Array String × Std.HashSet String) := do
+  match code with
+  | LCNF.Code.let_ decl k =>
+      let llvmTypeStr ← lcnfTypeToLLVMType decl.type
+      let mut instrs : Array String := #[]
+      let mut newSeenNames := currentSeenNames
+
+      -- All let decls define a new variable `decl.varId` whose LLVM name must be unique.
+      let declSsaName ← getLLVMSsaValueForFVar decl.varId
+      if newSeenNames.contains declSsaName then
+        throwCodegenError s!"Duplicate SSA name '{declSsaName}' generated for FVarId '{decl.varId.name}' in a let-binding."
+      else
+        newSeenNames := newSeenNames.insert declSsaName
+
+      match decl.value with
+      | LCNF.LetValue.lit _ =>
+          -- No instruction for a literal
+          pure ()
+      | LCNF.LetValue.var _ =>
+          -- No instruction for a variable alias
+          pure ()
+      | LCNF.LetValue.prim opName args =>
+          match PrimInfo.table.find? opName with
+          | none => throwCodegenError s!"Unsupported primitive '{opName}'"
+          | some primInfo =>
+              let argSsaValueNames ← args.mapM codegenArg
+
+              if argSsaValueNames.size != primInfo.arity then
+                throwCodegenError s!"Primitive '{opName}' expects {primInfo.arity} operands, got {argSsaValueNames.size}"
+
+              let resultSsaName := declSsaName
+
+              if primInfo.arity == 2 then
+                instrs := instrs.push s!"{resultSsaName} = {primInfo.llvmOpcode} {llvmTypeStr} {argSsaValueNames[0]!}, {argSsaValueNames[1]!}"
+              else
+                throwCodegenError s!"Primitive '{opName}' with arity {primInfo.arity} not yet fully supported in SSA instruction generation template."
+
+      let (restInstrs, finalSeenNamesFromK) ← codegenCode k newSeenNames
+      pure (instrs ++ restInstrs, finalSeenNamesFromK)
+
+  | LCNF.Code.return_ retVal =>
+      let llvmTypeStr := "i64"
+      let retSsaValueName ← codegenArg retVal
+      pure (#[s!"ret {llvmTypeStr} {retSsaValueName}"], currentSeenNames)
+
+def codegenFunDef (funDef : LCNF.FunDef) : LangM String := do
+  let fnName := funDef.name.toString
+  let mut paramSignatureParts : List String := []
+  let mut seenNames : Std.HashSet String := Std.HashSet.emptyWithCapacity 0
+
+  for param in funDef.params do
+    let paramLLVMType ← lcnfTypeToLLVMType param.type
+    let llvmParamSsaName ← getLLVMSsaValueForFVar param.varId
+
+    if seenNames.contains llvmParamSsaName then
+      throwCodegenError s!"Duplicate SSA name '{llvmParamSsaName}' generated for parameter FVarId '{param.varId.name}'."
+    else
+      seenNames := seenNames.insert llvmParamSsaName
+
+    paramSignatureParts := s!"{paramLLVMType} {llvmParamSsaName}" :: paramSignatureParts
+
+  let paramsString := String.join (paramSignatureParts.reverse.intersperse ", ")
+  let retTypeStr := "i64"
+
+  let mut funcIrLines : Array String := #[]
+  funcIrLines := funcIrLines.push s!"define {retTypeStr} @{fnName}({paramsString})"
+  funcIrLines := funcIrLines.push "{"
+
+  let (bodyInstructions, _finalSeenNames) ← codegenCode funDef.body seenNames
+  funcIrLines := funcIrLines ++ bodyInstructions
+
+  funcIrLines := funcIrLines.push "}"
+  pure (String.intercalate "\n" funcIrLines.toList)
+
+def emitLLVM (funDefs : List LCNF.FunDef) : LangM String := do
+  -- The `fvarDb` (populated by AlphaRename/Lowering) provides `FVarId`-to-LLVM-name mappings and is read-only in this pass.
+  let mut moduleIrString := ""
+  -- For more complete LLVM IR, one might add target datalayout and triple here.
+  for funDef in funDefs do
+    let funIr ← codegenFunDef funDef
+    moduleIrString := moduleIrString ++ "\n" ++ funIr -- Add a newline for separation
+
+  pure moduleIrString
+
+end Lang.Codegen
+
+---
+File: Lang/Driver.lean
+import Lean
+import Lang.AST
+import Lang.Monad
+import Lang.Syntax
+import Lang.Parser
+import Lang.Checker
+import Lang.AlphaRename
+import Lang.Lower
+import Lang.Optimize
+import Lang.Codegen
+
+open Lean Lang.AST Lang.LCNF Lang.Monad Lang.Optimize
+
+namespace Lang.Driver
+
+/-- Core compilation function -/
+@[inline]
+def compile (env : Environment) (src : String) : EIO LangError String := do
+  match Lang.Syntax.parse env src with
+  | Except.error err => throw (LangError.syntaxError err)
+  | Except.ok stx =>
+    let options : LangGlobalOptions := {}
+    let langMComputation : LangM String := do
+      let astDecl ← Lang.Parser.parse stx
+      let funAst ← match astDecl with
+                    | Lang.AST.Decl.funDef f => pure f
+      discard <| Lang.Checker.checkFunDef funAst
+      let alphaRenamedFunAst ← Lang.AlphaRename.alphaRenameFunDef funAst
+      let lcnfFunDef ← Lang.Lower.lowerFunDef alphaRenamedFunAst
+      let optimizedLcnfFunDef ← Lang.Optimize.optimizeFunDef lcnfFunDef
+      Lang.Codegen.codegenFunDef optimizedLcnfFunDef
+    Lang.Monad.runLangM' options langMComputation
+
+end Lang.Driver
+
+---
+File: Lang/Eval.lean
+import Lang.AST
+import Lang.Monad
+import Std.Data.HashMap
+
+open Lang.AST Lang.Monad
+
+/-- Evaluation environment: variable name (String) to value (Nat). -/
+abbrev Env := Std.HashMap String Nat
+
+/-- AST big-step interpreter. Returns `Except LangError Nat`. -/
+def eval (env : Env) : Expr → Except LangError Nat
+| Expr.lit n      => pure n
+| Expr.var name   =>
+  match env.get? name with
+  | some val => pure val
+  | none     => throw (LangError.generic s!"Eval: Undefined variable '{name}'")
+| Expr.add a b    => do
+    let valA ← eval env a
+    let valB ← eval env b
+    pure (valA + valB)
+
+---
+File: Lang/LCNF.lean
+import Lean
+import Lang.AST
+import Std.Data.HashMap
+
+namespace Lang.LCNF
+open Lean
+open Lang.AST
+
+/-- Generates an LLVM SSA variable name from a `Lean.FVarId` using a hash of its internal name (e.g., `%{12345}`). -/
+def llvmName (id : Lean.FVarId) : String :=
+  let h := id.name.hash % 100000
+  s!"%{h}"
+
+structure Param where
+  varId     : Lean.FVarId
+  binderName : Lean.Name
+  type       : LangTypeExpr
+  deriving Repr
+
+inductive Arg where
+  | fvar (fvarId : Lean.FVarId)
+  | lit (val : Nat)
+  deriving Repr
+
+inductive LetValue where
+  | lit (val : Nat)
+  | var (fvarId : Lean.FVarId)
+  | prim (opName : Lean.Name) (args : Array Arg)
+  deriving Repr
+
+structure LetDecl where
+  varId     : Lean.FVarId
+  binderName : Lean.Name
+  type       : LangTypeExpr
+  value      : LetValue
+  deriving Repr
+
+inductive Code where
+  | let_ (decl : LetDecl) (k : Code) : Code
+  | return_ (retVal : Arg) : Code
+  deriving Repr
+
+
+structure FunDef where
+  name    : Lean.Name
+  params  : Array Param
+  body    : Code
+  deriving Repr
+
+end Lang.LCNF
+
+---
+File: Lang/Lower.lean
+import Lean
+import Lang.AST
+import Lang.LCNF
+import Lang.Monad
+import Lang.AlphaRename
+import Lang.Prim
+import Std.Data.HashMap
+
+
+open Lean (Name)
+open Lang.AST (Expr FunDef)
+open Lang.LCNF
+open Lang.Monad
+
+namespace Lang.Lower
+
+open Lean Lang.Monad Lang.LCNF Lang.AST Lang.Prim
+
+/-- Lowers `AST.Expr` to LCNF (`LetDecl` list and final `Arg`). Resolves/creates `FVarId`s. -/
+def lowerExpr (expr : Lang.AST.Expr) : LangM (List Lang.LCNF.LetDecl × Lang.LCNF.Arg) :=
+  match expr with
+  | Lang.AST.Expr.lit n =>
+    return ([], Lang.LCNF.Arg.lit n)
+  | Lang.AST.Expr.var name => do
+    let fvarId ← getFVarIdForUniqueVar name
+    return ([], Lang.LCNF.Arg.fvar fvarId)
+  | Lang.AST.Expr.add lhs rhs => do
+    let (lhsDecls, lhsArg) ← lowerExpr lhs
+    let (rhsDecls, rhsArg) ← lowerExpr rhs
+    let resultType := Lang.AST.LangTypeExpr.int64
+    let resultVarId ← Lean.mkFreshFVarId
+
+    -- Re-use the deterministic LLVM name everywhere
+    let resultLlvmNameStr := LCNF.llvmName resultVarId
+    let resultUniqueNameStr := resultLlvmNameStr
+    -- For the binder we strip the leading '%' so it stays a valid Lean identifier.
+    let resultBinderName := Lean.Name.mkSimple (resultLlvmNameStr.drop 1)
+
+    let fvarInfoEntry : FVarInfo := { uniqueName := resultUniqueNameStr }
+    modify fun s => { s with fvarDb :=
+      { infoById := s.fvarDb.infoById.insert resultVarId fvarInfoEntry,
+        idByName := s.fvarDb.idByName.insert resultUniqueNameStr resultVarId
+      }
+    }
+
+    let addPrimKeyName : Name := `lang_add
+    match Lang.Prim.PrimInfo.table.find? addPrimKeyName with
+    | none => throwLoweringError s!"Lowering: Primitive operation '{addPrimKeyName}' not defined in PrimInfo."
+    | some addInfo =>
+      let addArgs := #[lhsArg, rhsArg]
+      let addDecl : Lang.LCNF.LetDecl := {
+        varId      := resultVarId,
+        binderName := resultBinderName,
+        type       := resultType,
+        value      := Lang.LCNF.LetValue.prim addInfo.leanName addArgs
+      }
+      let allDecls := lhsDecls ++ rhsDecls ++ [addDecl]
+      return (allDecls, Lang.LCNF.Arg.fvar resultVarId)
+
+/-- Lowers `AST.FunDef` to `LCNF.FunDef`. Alpha-renames, creates LCNF params, lowers body. -/
+def lowerFunDef (funDef : Lang.AST.FunDef) : LangM Lang.LCNF.FunDef := do
+  let alphaRenamedFunDefAst ← Lang.AlphaRename.alphaRenameFunDef funDef
+  let mut lcnfParams : Array Lang.LCNF.Param := #[]
+  -- FVarIds are retrieved via getFVarIdForUniqueVar, using the unique names from alphaRenamedFunDefAst.
+  for (pNameUniqueStr, pTypeExpr) in alphaRenamedFunDefAst.params do
+    let pFVarId ← getFVarIdForUniqueVar pNameUniqueStr
+    lcnfParams := lcnfParams.push {
+      varId      := pFVarId,
+      binderName := Lean.Name.mkSimple (if pNameUniqueStr.startsWith "%" then pNameUniqueStr.drop 1 else pNameUniqueStr),
+      type       := pTypeExpr
+    }
+
+  let (bodyDecls, finalBodyArg) ← lowerExpr alphaRenamedFunDefAst.body
+  let lcnfBodyCode := bodyDecls.foldr (fun decl k => Lang.LCNF.Code.let_ decl k) (Lang.LCNF.Code.return_ finalBodyArg)
+
+  pure {
+    name   := Lean.Name.mkSimple alphaRenamedFunDefAst.name,
+    params := lcnfParams,
+    body   := lcnfBodyCode
+  }
+
+end Lang.Lower
+
+---
+File: Lang/Monad.lean
+import Lean
+import Lang.LCNF
+import Std.Data.HashMap
+
+open Lang.LCNF
+open Lean
+
+namespace Lang.Monad
+
+inductive LangError where
+  | syntaxError (msg : String)
+  | typeError (msg : String)
+  | nameError (msg : String)
+  | loweringError (msg : String)
+  | codegenError (msg : String)
+  | optimizationError (msg : String)
+  | internalError (msg : String)
+  | generic (msg : String)
+deriving Repr
+
+def langErrorToIOError : LangError → IO.Error
+  | LangError.syntaxError msg => IO.userError s!"Syntax Error: {msg}"
+  | LangError.typeError msg => IO.userError s!"Type Error: {msg}"
+  | LangError.nameError msg => IO.userError s!"Name Error: {msg}"
+  | LangError.loweringError msg => IO.userError s!"Lowering Error: {msg}"
+  | LangError.codegenError msg => IO.userError s!"Code Generation Error: {msg}"
+  | LangError.optimizationError msg => IO.userError s!"Optimization Error: {msg}"
+  | LangError.internalError msg => IO.userError s!"Internal Compiler Error: {msg}"
+  | LangError.generic msg => IO.userError s!"Compilation Error: {msg}"
+
+def toIO {α : Type} (x : EIO LangError α) : IO α :=
+  EIO.toIO langErrorToIOError x
+
+structure LangGlobalOptions where
+  dummyOption : Bool := true -- Placeholder option
+  deriving Inhabited, Nonempty
+
+structure FVarInfo where
+  uniqueName       : String -- LLVM-compatible SSA name (e.g., "%{hash}")
+  /-- Aliased value (`LCNF.Arg`) if `FVarId` is constant/alias. Used by optimizer. -/
+  valueAlias       : Option LCNF.Arg := none
+  deriving Inhabited
+
+/-- Bidirectional mapping: `FVarId` <=> unique string name (`FVarInfo`). -/
+structure FVarNameDb where
+  infoById   : Std.HashMap Lean.FVarId FVarInfo := Std.HashMap.emptyWithCapacity 0
+  idByName   : Std.HashMap String Lean.FVarId    := Std.HashMap.emptyWithCapacity 0
+  deriving Inhabited
+
+/-- Lang compiler state. -/
+structure LangState where
+  fvarDb           : FVarNameDb := default
+  nameGen          : NameGenerator := default
+  deriving Inhabited
+
+
+abbrev LangM := ReaderT LangGlobalOptions (StateT LangState (EIO LangError))
+
+def throwSyntaxError (msg : String) : LangM α :=
+  throw (LangError.syntaxError msg)
+
+def throwTypeError (msg : String) : LangM α :=
+  throw (LangError.typeError msg)
+
+def throwNameError (msg : String) : LangM α :=
+  throw (LangError.nameError msg)
+
+def throwLoweringError (msg : String) : LangM α :=
+  throw (LangError.loweringError msg)
+
+def throwCodegenError (msg : String) : LangM α :=
+  throw (LangError.codegenError msg)
+
+def throwOptimizationError (msg : String) : LangM α :=
+  throw (LangError.optimizationError msg)
+
+def throwInternalError (msg : String) : LangM α :=
+  throw (LangError.internalError msg)
+
+def throwLangError (msg : String) : LangM α :=
+  throw (LangError.generic msg)
+
+instance : MonadNameGenerator LangM where
+  getNGen := do pure (← get).nameGen
+  setNGen ngen := modify fun s => { s with nameGen := ngen }
+
+def runLangM (options: LangGlobalOptions) (x : LangM α)
+    : EIO LangError (α × LangState) :=
+  let initialMutableState : LangState := {
+    fvarDb := default,
+    nameGen := default
+  }
+  (ReaderT.run x options).run initialMutableState
+
+def runLangM' (options: LangGlobalOptions) (x : LangM α)
+    : EIO LangError α :=
+  Prod.fst <$> runLangM options x
+
+def getFVarIdForUniqueVar (uniqueNameKey : String) : LangM Lean.FVarId := do
+  let s ← get
+  match s.fvarDb.idByName.get? uniqueNameKey with
+  | some fvarId => pure fvarId
+  | none => throwInternalError s!"FVarId for unique variable '{uniqueNameKey}' not found in fvarNameDb.idByName. Known names: {s.fvarDb.idByName.toList.map fun x => x.1}"
+
+
+
+end Lang.Monad
+
+---
+File: Lang/Optimize.lean
+import Lean
+import Lang.Monad
+import Lang.LCNF
+import Lang.Prim
+import Std.Data.HashMap
+import Std.Data.HashSet
+
+-- TODO: pass manager?
+
+namespace Lang.Optimize
+
+open Lean Lang.Monad Lang.LCNF Lang.Prim Std
+
+-- A map to store known constant Nat values for FVarIds during the pass
+abbrev ConstMap := Std.HashMap Lean.FVarId Nat
+
+/-- Constant folding on `LCNF.Code`. Propagates `ConstMap`, updates `LetDecl` values and `FVarInfo.valueAlias`. Returns `(LCNF.Code × ConstMap)`. -/
+partial def foldConstantsInCode (code : LCNF.Code) (consts : ConstMap) : Monad.LangM (LCNF.Code × ConstMap) := do
+  match code with
+  | LCNF.Code.let_ decl c =>
+    match decl.value with
+    | LCNF.LetValue.lit n =>
+      -- Record literal value for alias.
+      modify fun s =>
+        match s.fvarDb.infoById.get? decl.varId with
+        | some info =>
+          let newInfo : FVarInfo := { info with valueAlias := some (LCNF.Arg.lit n) }
+          { s with fvarDb := { s.fvarDb with infoById := s.fvarDb.infoById.insert decl.varId newInfo } }
+        | none => s -- should be unreachable
+      let newConsts := consts.insert decl.varId n
+      let (c', finalConsts) ← foldConstantsInCode c newConsts
+      pure (LCNF.Code.let_ decl c', finalConsts)
+
+    | LCNF.LetValue.var fvId =>
+      -- Record alias for another variable.
+      modify fun s =>
+        match s.fvarDb.infoById.get? decl.varId with
+        | some info =>
+          let newInfo : FVarInfo := { info with valueAlias := some (LCNF.Arg.fvar fvId) }
+          { s with fvarDb := { s.fvarDb with infoById := s.fvarDb.infoById.insert decl.varId newInfo } }
+        | none => s -- should be unreachable
+
+      let newConsts :=
+        match consts.get? fvId with
+        | some val => consts.insert decl.varId val
+        | none     => consts
+      let (c', finalConsts) ← foldConstantsInCode c newConsts
+      pure (LCNF.Code.let_ decl c', finalConsts)
+
+    | LCNF.LetValue.prim opName args =>
+      match PrimInfo.table.find? opName with
+      | some primInfo =>
+        match primInfo.foldingRule with
+        | some rule =>
+          let concreteArgs : List LCNF.Arg := args.toList.map fun arg =>
+            match arg with
+            | LCNF.Arg.fvar argFvId => match consts.get? argFvId with
+                                    | some knownNat => LCNF.Arg.lit knownNat
+                                    | none => arg
+            | LCNF.Arg.lit _ => arg
+
+          match rule concreteArgs with
+          | some (LCNF.Arg.lit foldedVal) =>
+            let foldedDecl : LCNF.LetDecl := { decl with value := LCNF.LetValue.lit foldedVal }
+            modify fun s =>
+              match s.fvarDb.infoById.get? decl.varId with
+              | some info =>
+                let newInfo : FVarInfo := { info with valueAlias := some (LCNF.Arg.lit foldedVal) }
+                { s with fvarDb := { s.fvarDb with infoById := s.fvarDb.infoById.insert decl.varId newInfo } }
+              | none => s -- should be unreachable
+            let newConsts := consts.insert decl.varId foldedVal
+            let (c', finalConsts) ← foldConstantsInCode c newConsts
+            pure (LCNF.Code.let_ foldedDecl c', finalConsts)
+          | _ =>
+            let (c', finalConsts) ← foldConstantsInCode c consts
+            pure (LCNF.Code.let_ decl c', finalConsts)
+        | none =>
+          let (c', finalConsts) ← foldConstantsInCode c consts
+          pure (LCNF.Code.let_ decl c', finalConsts)
+      | none =>
+        Lang.Monad.throwOptimizationError s!"Unknown primitive operation '{opName}' encountered during constant folding."
+
+  | LCNF.Code.return_ retVal =>
+    let resolvedRetVal :=
+      match retVal with
+      | LCNF.Arg.fvar fvId => match consts.get? fvId with
+                              | some n => LCNF.Arg.lit n
+                              | none   => retVal
+      | _ => retVal
+    pure (LCNF.Code.return_ resolvedRetVal, consts)
+
+def getArgFreeVars (arg : Arg) : HashSet FVarId :=
+  match arg with
+  | Arg.fvar fvarId => (HashSet.emptyWithCapacity 0).insert fvarId
+  | Arg.lit _       => HashSet.emptyWithCapacity 0
+
+def getLetValueFreeVars (value : LetValue) : HashSet FVarId :=
+  match value with
+  | LetValue.lit _         => HashSet.emptyWithCapacity 0
+  | LetValue.var fvarId    => (HashSet.emptyWithCapacity 0).insert fvarId
+  | LetValue.prim _ args =>
+    args.foldl (fun acc arg => acc.union (getArgFreeVars arg)) (HashSet.emptyWithCapacity 0)
+
+partial def dceCodeRecursive (code : Code) : LangM (Code × HashSet FVarId) := do
+  match code with
+  | Code.return_ retVal =>
+    -- For a return statement, the live variables are simply those free in its argument.
+    let liveVars := getArgFreeVars retVal
+    pure (Code.return_ retVal, liveVars)
+
+  | Code.let_ decl c =>
+    -- Recursively process the rest of the code (c) first.
+    let (cOpt, liveInC) ← dceCodeRecursive c
+    let liveInDeclValue := getLetValueFreeVars decl.value
+
+    -- A declaration is live if its varId is used in the subsequent optimized code (cOpt).
+    if liveInC.contains decl.varId then
+      -- Declaration is live. Keep it.
+      -- The new code is this declaration prepended to the optimized c (cOpt).
+      let newCode := Code.let_ decl cOpt
+      -- Variables that are alive before this 'let' are:
+      --   1. Those live in cOpt, excluding the one defined by this 'let' (decl.varId).
+      --   2. Those live in the value of the current declaration.
+      let liveHere := (liveInC.erase decl.varId).union liveInDeclValue
+      pure (newCode, liveHere)
+    else
+      -- Declaration is dead. Remove it.
+      -- The new code is just the optimized c (cOpt).
+      -- Variables that are alive before this (removed) 'let' are:
+      --   1. Those alive in cOpt.
+      --   2. Those alive in the value of the (now removed) declaration.
+      --      (These are needed if they weren't already covered by liveInK,
+      --       or they might become dead code further up).
+      let liveHere := liveInC.union liveInDeclValue
+      pure (cOpt, liveHere)
+
+def dceFunBody (code : Code) : LangM Code := do
+  let (newCode, _liveVarsAtStart) ← dceCodeRecursive code
+  pure newCode -- we don't care about the live variables at the start of the function body only the actual code
+
+def dceFunDef (funDef : FunDef) : LangM FunDef := do
+  let newBody ← dceFunBody funDef.body
+  pure { funDef with body := newBody }
+
+def optimizeFunDef (funDef : Lang.LCNF.FunDef) : Monad.LangM Lang.LCNF.FunDef := do
+  let (foldedBody, _) ← foldConstantsInCode funDef.body (Std.HashMap.emptyWithCapacity 0)
+  let funDefAfterFolding := { funDef with body := foldedBody }
+  let funDefAfterDCE ← dceFunDef funDefAfterFolding
+  pure funDefAfterDCE
+
+end Lang.Optimize
+
+---
+File: Lang/Parser.lean
+import Lean
+import Lang.Syntax
+import Lang.AST
+import Lang.Monad
+
+open Lean
+open Lang.Monad
+open Lang.AST
+
+namespace Lang.Parser
+
+def parseTypeIdent (typeName : Name) : Monad.LangM LangTypeExpr :=
+  if typeName == `Int64 then
+    pure LangTypeExpr.int64
+  else
+    Monad.throwSyntaxError (s!"Unsupported type identifier: {typeName}")
+
+/-- Parses `param_list` syntax (a sequence of `single_typed_param` nodes) to a flat list of (name, type) pairs. -/
+def parseParamsList (paramStxArray : Array Syntax) : Monad.LangM (List (String × LangTypeExpr)) := do
+  let paramPairs ← paramStxArray.foldlM (fun accParams eachParamNode => do
+    if eachParamNode.isOfKind `Lang.Syntax.singleTypedParamRule then
+      let pnameNode := eachParamNode.getArg 1
+      let ptypeNode := eachParamNode.getArg 3
+
+      if pnameNode.isIdent && ptypeNode.isIdent then
+        let typeExpr ← parseTypeIdent ptypeNode.getId
+        pure ((pnameNode.getId.toString, typeExpr) :: accParams)
+      else
+        Monad.throwSyntaxError (s!"Malformed single_typed_param: expected (ident : ident), got ({pnameNode} : {ptypeNode}) in {eachParamNode}")
+    else
+      Monad.throwSyntaxError (s!"Internal parser error: Expected singleTypedParamRule, got {eachParamNode.getKind}")
+  ) []
+  pure paramPairs.reverse
+
+partial def parseExpr (syntaxNode : Syntax) : Monad.LangM AST.Expr := do
+  let kind := syntaxNode.getKind
+  if kind == ``Lang.Syntax.lang_add then
+    let args := syntaxNode.getArgs
+    if args.size == 3 then -- Expected: [lhs_expr, plus_token, rhs_expr]
+      let eval_lhs ← parseExpr (args[0]!)
+      let eval_rhs ← parseExpr (args[2]!)
+      return AST.Expr.add eval_lhs eval_rhs
+    else
+      Monad.throwSyntaxError (s!"Malformed lang_add node (arity {args.size}): {syntaxNode}")
+  else if kind == ``Lang.Syntax.lang_paren then
+    let args := syntaxNode.getArgs
+    if args.size == 3 then -- Expected: [open_paren_token, actual_expr, close_paren_token]
+      parseExpr (args[1]!)
+    else
+      Monad.throwSyntaxError (s!"Malformed lang_paren node (arity {args.size}): {syntaxNode}")
+  else if kind == ``Lang.Syntax.lang_num then
+    let args := syntaxNode.getArgs
+    if args.size == 1 then
+      let numNode := args[0]!
+      match numNode.isNatLit? with
+      | some val => pure (AST.Expr.lit val)
+      | none => Monad.throwSyntaxError (s!"Numeric literal is not a Nat: {numNode} in {syntaxNode}")
+    else
+      Monad.throwSyntaxError (s!"Malformed lang_num node (arity {args.size}, expected 1): {syntaxNode}")
+  else if kind == ``Lang.Syntax.lang_ident then
+    let args := syntaxNode.getArgs
+    if args.size == 1 && args[0]!.isIdent then -- Expected: [ident_atom]
+      pure (AST.Expr.var (args[0]!).getId.toString)
+    else
+      Monad.throwSyntaxError (s!"Malformed lang_ident node (child not ident or arity {args.size}): {syntaxNode}")
+  else
+    Monad.throwSyntaxError (s!"Invalid expression _syntax (unknown kind {kind}): {syntaxNode}")
+
+def parse (syntaxNode : Syntax) : Monad.LangM AST.Decl :=
+  let decl_kind := syntaxNode.getKind
+  if decl_kind == ``Lang.Syntax.lang_function_def then
+    match syntaxNode with
+    | `(Lang.Syntax.lang_function_def| def $name:ident $[$paramStxArray:single_typed_param]* : $retTypeIdent:ident := $body) => do
+        let bodyExpr ← parseExpr body
+        let paramPairs ← parseParamsList paramStxArray
+        let returnTypeExpr ← parseTypeIdent retTypeIdent.getId
+
+        let funDef : AST.FunDef := {
+          name       := name.getId.toString,
+          params     := paramPairs,
+          returnType := returnTypeExpr,
+          body       := bodyExpr
+        }
+        return AST.Decl.funDef funDef
+    | _ => Monad.throwSyntaxError (s!"Internal error: Mismatched stx for lang_function_def: {syntaxNode}")
+  else
+    Monad.throwSyntaxError (s!"Invalid declaration syntax (unknown kind {decl_kind}): {syntaxNode}")
+
+end Lang.Parser
+
+---
+File: Lang/Prim.lean
+import Lean
+import Lean.Data.NameMap
+import Lang.LCNF -- Required for LCNF.Arg
+
+open Lean -- Open Lean namespace for direct access to Name, NameMap etc.
+
+namespace Lang.Prim
+
+/-- Primitive operation metadata: `leanName`, `arity`, `llvmOpcode`, optional `foldingRule` (`List LCNF.Arg → Option LCNF.Arg`). -/
+structure PrimInfo where
+  leanName    : Name
+  arity       : Nat
+  llvmOpcode  : String
+  foldingRule : Option (List LCNF.Arg → Option LCNF.Arg)
+
+namespace PrimInfo
+
+/-- Constant folding for `lang_add`: `lit n + lit m -> lit (n+m)`. -/
+def foldAdd (args : List LCNF.Arg) : Option LCNF.Arg :=
+  if h : args.length = 2 then
+    match args[0], args[1] with
+    | LCNF.Arg.lit val1, LCNF.Arg.lit val2 =>
+      some (LCNF.Arg.lit (val1 + val2))
+    | _, _ => none
+  else
+    none
+
+/-- Map from primitive `Name` to `PrimInfo`. Defines recognized primitives. -/
+def table : NameMap PrimInfo :=
+  mkNameMap PrimInfo
+  |>.insert `lang_add {
+    leanName    := `lang_add,
+    arity       := 2,
+    llvmOpcode  := "add",
+    foldingRule := some foldAdd
+  }
+
+end PrimInfo
+
+end Lang.Prim
+
+---
+File: Lang/Syntax.lean
+import Lean
+open Lean (Environment)
+
+
+namespace Lang.Syntax
+
+declare_syntax_cat lang_expr
+syntax (name := lang_num) num : lang_expr
+syntax (name := lang_ident) ident : lang_expr
+syntax (name := lang_paren) "(" lang_expr ")" : lang_expr
+syntax (name := lang_add) lang_expr "+" lang_expr : lang_expr
+
+-- A single, typed parameter e.g. `(x : Int64)`
+declare_syntax_cat single_typed_param
+syntax (name := singleTypedParamRule) "(" ident ":" ident ")" : single_typed_param
+
+declare_syntax_cat lang_decl
+-- Return type is *mandatory*
+syntax (name := lang_function_def) "def" ident single_typed_param* ":" ident ":=" lang_expr : lang_decl
+
+def parse (env : Environment) (input : String) : Except String Lean.Syntax :=
+  Lean.Parser.runParserCategory env `lang_decl input
+
+end Lang.Syntax
+
+---
+File: Lang/Test.lean
+import Lean
+import Lean.Environment
+import Lean.Elab.Frontend
+import Std.Data.HashMap
+
+import Lang.AST
+import Lang.Monad
+import Lang.Driver
+import Lang.Util
+
+import Init.System.IO -- For EIO.toIO'
+
+open Lang
+open Lang.Monad
+open System
+open IO.FS
+open Lean (Environment)
+open IO
+
+structure CodegenTestCase where
+  name : String
+  deriving Repr
+
+/--
+Normalizes LLVM IR to make variable names canonical for alpha-invariant testing.
+-/
+def normalizeLLVMVariables (code : String) : String := Id.run do
+  let originalLines := code.splitOn "\n"
+  let mut varMap : Std.HashMap String String := Std.HashMap.emptyWithCapacity 0
+  let mut nextParamIdx := 0
+  let mut nextTempIdx := 0
+
+  -- Pass 1: Populate varMap with mappings for parameters and temporary variables
+  for line in originalLines do
+    let trimmedLine := line.trim
+    -- Parameter identification
+    if trimmedLine.startsWith "define" then
+      let openParenPos := trimmedLine.posOf '('
+      let closeParenPos := trimmedLine.posOf ')'
+      if openParenPos != trimmedLine.endPos && closeParenPos != trimmedLine.endPos && openParenPos < closeParenPos then
+        let paramsPart := trimmedLine.extract (openParenPos + String.Pos.mk 1) closeParenPos
+        let paramDefs := paramsPart.splitOn "," |>.map String.trim
+        for paramDef in paramDefs do
+          let parts := paramDef.splitOn " "
+          let optParamName := parts.find? (fun s => s.startsWith "%" && !(s.endsWith ":"))
+          if let some paramName := optParamName then
+            unless varMap.contains paramName do
+              let newName := s!"%param{nextParamIdx}"
+              varMap := varMap.insert paramName newName
+              nextParamIdx := nextParamIdx + 1
+
+    let potentialDef := trimmedLine
+    if potentialDef.startsWith "%" then
+      match potentialDef.splitOn " = " with
+      | [defVarCandidate, _] =>
+        let defVar := defVarCandidate.trim
+        if defVar.startsWith "%" && !(defVar.contains ' ') && !(defVar.endsWith ":") then
+          unless varMap.contains defVar do
+            let newName := s!"%temp{nextTempIdx}"
+            varMap := varMap.insert defVar newName
+            nextTempIdx := nextTempIdx + 1
+      | _ => ()
+
+  -- Pass 2: Apply transformations using the populated varMap
+  let mut finalNormalizedLines : Array String := #[]
+  for line in originalLines do
+    let mut currentLine := line
+    let sortedKeys := varMap.keysArray.qsort (fun a b => a.length > b.length)
+    for oldName in sortedKeys do
+      if let some newName := varMap[oldName]? then
+        currentLine := currentLine.replace oldName newName
+    finalNormalizedLines := finalNormalizedLines.push currentLine
+
+  "\n".intercalate finalNormalizedLines.toList
+
+def normalizeOutputCode (code : String) : String :=
+  let varNormalizedCode := normalizeLLVMVariables code
+  "\n".intercalate <| (varNormalizedCode.splitOn "\n").map String.trim |>.filter (fun s => ¬s.isEmpty)
+
+def discoverTests (sourcesDir : FilePath) (expectedDir : FilePath) : IO (Array CodegenTestCase) := do
+  let mut testCases := #[]
+  unless ← sourcesDir.pathExists do
+    IO.eprintln s!"Warning: Sources directory '{sourcesDir}' does not exist."
+    return #[]
+  unless ← expectedDir.pathExists do
+    IO.eprintln s!"Warning: Expected LLVM directory '{expectedDir}' does not exist."
+    return #[]
+
+  for entry in ← sourcesDir.readDir do
+    let meta ← FilePath.metadata entry.path
+    if meta.type == FileType.file then
+      let fileName := entry.fileName
+      if fileName.endsWith ".lang" then
+        let testName := fileName.dropRight ".lang".length
+        let expectedLLVMPath := expectedDir / (testName ++ ".ll")
+        if ← expectedLLVMPath.pathExists then
+          testCases := testCases.push { name := testName }
+        else
+          IO.eprintln s!"Warning: Found source file '{entry.path}' but no corresponding expected LLVM file '{expectedLLVMPath}'."
+  return testCases
+
+def runTest (env : Environment) (testCase : CodegenTestCase) : IO Bool := do
+  IO.println s!"Running test: {testCase.name}"
+  let srcPath := FilePath.mk "examples/Sources" / (testCase.name ++ ".lang")
+  let expectedPath := FilePath.mk "examples/ExpectedLLVM" / (testCase.name ++ ".ll")
+  let src ← readFile srcPath
+  let expectedLLVM ← readFile expectedPath
+
+  let eCombinedResult : IO (Except Lang.Monad.LangError String) :=
+    EIO.toIO' (Lang.Driver.compile env src)
+
+  match ← eCombinedResult with
+  | Except.error err =>
+    IO.println s!"  FAIL: {testCase.name} - LangM Error:"
+    IO.eprintln (langErrorToIOError err)
+    return false
+  | Except.ok generatedLLVMCode =>
+    let genNorm := normalizeOutputCode generatedLLVMCode
+    let expNorm := normalizeOutputCode expectedLLVM
+    if genNorm == expNorm then
+      IO.println s!"  PASS: {testCase.name}"
+      return true
+    else
+      IO.println s!"  FAIL: {testCase.name}"
+      IO.println "  Expected (normalized LLVM):"
+      IO.println expNorm
+      IO.println "  Got (normalized LLVM):"
+      IO.println genNorm
+      IO.println "--- Original Expected LLVM ---"
+      IO.println expectedLLVM
+      IO.println "--- Original Generated LLVM ---"
+      IO.println generatedLLVMCode
+      return false
+
+unsafe def main (_args : List String) : IO UInt32 := do
+  Lean.initSearchPath (← Lean.findSysroot)
+
+  let env ← Lang.Util.createLangEnvironment
+  let sourcesPath := FilePath.mk "examples/Sources"
+  let expectedLLVMPath := FilePath.mk "examples/ExpectedLLVM"
+  let discoveredTests ← discoverTests sourcesPath expectedLLVMPath
+
+  if discoveredTests.isEmpty then
+    IO.println "Warning: No test cases found or matched. Ensure '*.lang' files in 'examples/Sources' have corresponding '*.ll' files in 'examples/ExpectedLLVM'."
+    IO.println "No tests run. Exiting."
+    return 1
+
+  let results ← discoveredTests.mapM (runTest env)
+  let numTests := discoveredTests.size
+  let numPassed := results.filter (· == true) |>.size
+
+  if numPassed == numTests then
+    IO.println s!"All {numTests} codegen tests passed!"
+    return 0
+  else
+    IO.println s!"{numPassed}/{numTests} codegen tests passed. Some tests failed."
+    return 1
+
+---
+File: Lang/Util.lean
+import Lean
+import Lean.Util.Path
+import Init.System.IO
+import Lean.Elab.Frontend
+
+namespace Lang.Util
+
+/-- Initialises a Lean `Environment` that knows about `Lang.Syntax` (our custom grammar). -/
+unsafe def createLangEnvironment : IO Lean.Environment := do
+  Lean.enableInitializersExecution -- this is *essential* for loading the syntax extension and i have absolutely no idea why...
+  Lean.initSearchPath (← Lean.findSysroot) [(← IO.currentDir) / ".lake" / "build" / "lib" / "lean"] -- it should be `.lake` but just in case.
+
+  let inputCtx := Lean.Parser.mkInputContext "import Lang.Syntax\n#eval 0\n" "<env_init>"
+  let (header, parserState, messages) ← Lean.Parser.parseHeader inputCtx
+  let (envAfterHeader, messagesAfterHeader) ← Lean.Elab.processHeader header {} messages inputCtx
+  let initialCommandState := Lean.Elab.Command.mkState envAfterHeader messagesAfterHeader {}
+  let frontendState ← Lean.Elab.IO.processCommands inputCtx parserState initialCommandState
+
+  if frontendState.commandState.messages.hasErrors then
+    frontendState.commandState.messages.forM fun msg => msg.toString >>= IO.eprintln
+    throw <| IO.userError "Lang.Util.createLangEnvironment: Failed to initialize environment due to errors in dummy input processing."
+
+  return frontendState.commandState.env
+
+end Lang.Util
+
+---
