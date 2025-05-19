@@ -1,0 +1,1 @@
+def const_fold_add : Int64 := 10 + 20 

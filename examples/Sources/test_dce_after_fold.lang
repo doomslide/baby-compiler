@@ -1,0 +1,1 @@
+def dce_after_fold (p : Int64) : Int64 := (10 + 5) + p 
