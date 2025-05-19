@@ -80,7 +80,7 @@ Note: The `compiler` executable may not work if run outside of the project root 
     *   `Driver.lean`: Core compilation pipeline logic.
     *   `Util.lean`: Enviornment setup.
     *   `Test.lean`: Tests on the sources in `examples`.
-    *   `Eval.lean`: A direct evaluator/interpreter for the AST (whose purpose shall remain mysterious for now.)
+    *   `Eval.lean`: Evaluator for the AST (whose purpose shall remain mysterious for now.)
 *   `examples/`: Example programs and expected outputs:
     *   `Sources/`: `.lang` source files.
     *   `ExpectedLLVM/`: `.ll` files with expected LLVM IR.
